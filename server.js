@@ -73,7 +73,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Alternative search endpoint sorting in descending order.
+// Alternative search endpoint: sort by _id descending.
 app.get('/api/search1', async (req, res) => {
   const query = req.query.q;
   if (!query) {
@@ -106,10 +106,9 @@ if (process.env.NODE_ENV !== 'production' || require.main === module) {
   });
 }
 
-// Export for serverless deployment.
-// Wrap the handler so that context.callbackWaitsForEmptyEventLoop is set to false.
+// Wrap the serverless handler to set callbackWaitsForEmptyEventLoop to false.
 const handler = serverless(app);
-module.exports.handler = (event, context, callback) => {
+module.exports = (event, context, callback) => {
   context.callbackWaitsForEmptyEventLoop = false;
   return handler(event, context, callback);
 };
