@@ -8,7 +8,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const MONGODB_URL = process.env.MONGODB_URL; // e.g., set in .env
+// Ensure the connection string is defined
+const MONGODB_URL = process.env.MONGODB_URL;
+if (!MONGODB_URL) {
+  console.error("MONGODB_URL is not defined. Please set it in your environment variables.");
+  throw new Error("MONGODB_URL environment variable is not set.");
+}
+
 const DB_NAME = process.env.DB_NAME || "naivasProducts";
 
 // Global cache for the MongoDB client
@@ -17,10 +23,9 @@ let cachedClient = null;
 async function getMongoClient() {
   if (cachedClient) return cachedClient;
   const client = new MongoClient(MONGODB_URL, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
+    // These options set a shorter timeout to avoid long waits.
+    // Note: useNewUrlParser and useUnifiedTopology are defaults in v4+.
     tls: true,
-    // Allow invalid certs in non-production environments only
     tlsAllowInvalidCertificates: process.env.NODE_ENV !== 'production',
     connectTimeoutMS: 5000,
     socketTimeoutMS: 5000,
@@ -34,21 +39,16 @@ async function getMongoClient() {
 async function getProductsCollection() {
   const client = await getMongoClient();
   const db = client.db(DB_NAME);
-  return db.collection("products");
-}
-
-// Create the text index once on cold start
-(async () => {
+  const collection = db.collection("products");
   try {
-    const client = await getMongoClient();
-    const db = client.db(DB_NAME);
-    const collection = db.collection("products");
+    // Create a text index only once on cold start.
     await collection.createIndex({ productTitle: "text", category: "text" });
-    console.log("Index created successfully");
+    console.log("Index created successfully.");
   } catch (err) {
     console.error("Error creating index:", err);
   }
-})();
+  return collection;
+}
 
 // Health-check endpoint.
 app.get('/api/health', (req, res) => {
@@ -59,6 +59,7 @@ app.get('/api/health', (req, res) => {
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing query parameter 'q'" });
+  
   const limit = parseInt(req.query.limit, 10) || 20;
   try {
     const collection = await getProductsCollection();
@@ -77,6 +78,7 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/search1', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing query parameter 'q'" });
+  
   const limit = parseInt(req.query.limit, 10) || 20;
   try {
     const collection = await getProductsCollection();
@@ -91,7 +93,7 @@ app.get('/api/search1', async (req, res) => {
   }
 });
 
-// For local development: listen on a port if not in production.
+// For local development, listen on a port if not in production.
 if (process.env.NODE_ENV !== 'production' || require.main === module) {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
@@ -99,8 +101,7 @@ if (process.env.NODE_ENV !== 'production' || require.main === module) {
   });
 }
 
-// Export default handler for serverless deployment.
-// We set callbackWaitsForEmptyEventLoop to false so that open connections don't delay the response.
+// Wrap the serverless handler so that callbackWaitsForEmptyEventLoop is false.
 const handler = serverless(app);
 module.exports = (event, context, callback) => {
   context.callbackWaitsForEmptyEventLoop = false;
