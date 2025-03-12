@@ -1,368 +1,115 @@
-require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const cookieParser = require('cookie-parser');
+const { MongoClient } = require('mongodb');
 const serverless = require('serverless-http');
-const morgan = require('morgan');
-const winston = require('winston');
-const axios = require('axios');
-const crypto = require('crypto');
+require('dotenv').config();
+const cors = require("cors");
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+app.use(cors());
+app.use(express.json());
 
-// --- Global Cached Mongoose Connection ---
-// This caching pattern reuses the connection across invocations.
-// It is similar to your MongoClient caching where we use a global variable.
-if (!global.__MONGO_CONN__) {
-  global.__MONGO_CONN__ = null;
-}
+const MONGODB_URL = process.env.MONGODB_URL; // e.g., set in .env
+const DB_NAME = process.env.DB_NAME || "naivasProducts";
 
-async function dbConnect() {
-  if (global.__MONGO_CONN__) {
-    return global.__MONGO_CONN__;
-  }
-  if (!process.env.MONGODB_URI) {
-    throw new Error("MONGODB_URI is not defined in .env");
-  }
-  // Connect with options similar to your MongoClient snippet.
-  // Note: In Mongoose 6+ some options like useNewUrlParser and useUnifiedTopology are no longer required.
-  global.__MONGO_CONN__ = mongoose.connect(process.env.MONGODB_URI, {
+// Global cache for the MongoDB client
+let cachedClient = null;
+
+async function getMongoClient() {
+  if (cachedClient) return cachedClient;
+  const client = new MongoClient(MONGODB_URL, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    tls: true,
+    tlsAllowInvalidCertificates: true, // For testing – remove in production
     connectTimeoutMS: 30000,
     socketTimeoutMS: 30000,
-    tls: true,
-    tlsAllowInvalidCertificates: process.env.NODE_ENV !== 'production',
     retryWrites: false
   });
-  return global.__MONGO_CONN__;
+  await client.connect();
+  cachedClient = client;
+  return client;
 }
 
-// Initiate the connection on cold start.
-dbConnect()
-  .then(() => console.log("MongoDB connected (cached)"))
-  .catch(err => {
-    console.error("MongoDB connection error:", err);
-    process.exit(1);
-  });
-
-// -----------------------------
-// Express Middleware & Configuration
-// -----------------------------
-app.set('trust proxy', 1);
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-      winston.format.timestamp(),
-      winston.format.json()
-  ),
-  transports: [
-      new winston.transports.Console(),
-      new winston.transports.File({ filename: 'error.log', level: 'error' }),
-      new winston.transports.File({ filename: 'combined.log' }),
-  ],
-});
-
-app.use(express.json());
-app.use(cookieParser());
-app.use(helmet());
-app.use(cors({
-  origin: 'https://crypto1-ten.vercel.app', // Update this URL as needed.
-  credentials: true,
-}));
-app.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://crypto1-ten.vercel.app');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  return res.status(200).end();
-});
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://crypto1-ten.vercel.app');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  next();
-});
-app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  keyGenerator: (req, res) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use(limiter);
-
-// -----------------------------
-// Mongoose User Schema & Model
-// -----------------------------
-const userSchema = new mongoose.Schema({
-  username:    { type: String, required: true },
-  email:       { type: String, required: true, unique: true },
-  password:    { type: String, required: true },
-  country:     { type: String, required: true },
-  phoneNumber: { type: String, required: true },
-  investmentBalance: { type: Number, default: 0 },
-  totalInvested: { type: Number, default: 0 },
-  mines: { type: Number, default: 0 },
-  role: { type: String, default: "user" },
-  refreshToken: { type: String },
-}, { timestamps: true });
-const User = mongoose.models.User || mongoose.model('User', userSchema);
-
-// -----------------------------
-// Utility Functions for JWT Tokens
-// -----------------------------
-const generateAccessToken = (user) => jwt.sign(
-  { id: user._id, email: user.email, role: user.role },
-  process.env.JWT_SECRET,
-  { expiresIn: '15m' }
-);
-
-const generateRefreshToken = (user) => jwt.sign(
-  { id: user._id, email: user.email, role: user.role },
-  process.env.JWT_REFRESH_SECRET,
-  { expiresIn: '7d' }
-);
-
-// -----------------------------
-// Middleware: Protect Routes
-// -----------------------------
-const protect = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Not authorized, no token provided' });
-  }
-  const token = authHeader.split(' ')[1];
+async function getProductsCollection() {
+  const client = await getMongoClient();
+  const db = client.db(DB_NAME);
+  const collection = db.collection("products");
   try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.user = decoded;
-      next();
-  } catch (error) {
-      return res.status(401).json({ error: 'Not authorized, token failed' });
+    // Ensure a text index on productTitle and category
+    await collection.createIndex({ productTitle: "text", category: "text" });
+  } catch (err) {
+    console.error("Error creating index:", err);
   }
-};
-
-// -----------------------------
-// Authentication Endpoints
-// -----------------------------
-app.post('/api/auth/signup', async (req, res) => {
-  try {
-    await dbConnect();
-    const { username, email, password, country, phoneNumber } = req.body;
-    if (!username || !email || !password || !country || !phoneNumber) {
-      return res.status(400).json({ error: 'Please provide all required fields' });
-    }
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(409).json({ error: 'Username or Email already exists' });
-    }
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-    const user = await User.create({
-      username,
-      email,
-      password: hashedPassword,
-      country,
-      phoneNumber,
-      role: "user"
-    });
-    const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
-    user.refreshToken = refreshToken;
-    await user.save();
-    res.cookie('refreshToken', refreshToken, { 
-      httpOnly: true, 
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "Strict", 
-      maxAge: 7 * 24 * 60 * 60 * 1000 
-    });
-    res.status(201).json({ message: 'Sign up successful. Please sign in.', accessToken });
-  } catch (error) {
-    logger.error('Sign up error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/auth/signin', async (req, res) => {
-  try {
-    await dbConnect();
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Please provide email and password' });
-    }
-    const user = await User.findOne({ email });
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
-    user.refreshToken = refreshToken;
-    await user.save();
-    res.cookie('refreshToken', refreshToken, { 
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production", 
-      sameSite: "Strict", 
-      maxAge: 7 * 24 * 60 * 60 * 1000 
-    });
-    res.status(200).json({ message: 'Sign in successful', accessToken, roles: [user.role] });
-  } catch (error) {
-    logger.error('Sign in error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/auth/protected', protect, async (req, res) => {
-  try {
-    await dbConnect();
-    const user = await User.findById(req.user.id).select('-password -__v -refreshToken');
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.status(200).json({ user });
-  } catch (error) {
-    logger.error('Protected route error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/auth/refresh', async (req, res) => {
-  try {
-    await dbConnect();
-    const { refreshToken } = req.cookies;
-    if (!refreshToken) {
-      return res.status(401).json({ error: 'No refresh token provided' });
-    }
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-    const user = await User.findById(decoded.id);
-    if (!user || user.refreshToken !== refreshToken) {
-      return res.status(403).json({ error: 'Invalid refresh token' });
-    }
-    const newAccessToken = generateAccessToken(user);
-    const newRefreshToken = generateRefreshToken(user);
-    user.refreshToken = newRefreshToken;
-    await user.save();
-    res.cookie('refreshToken', newRefreshToken, { 
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "Strict", 
-      maxAge: 7 * 24 * 60 * 60 * 1000 
-    });
-    res.status(200).json({ accessToken: newAccessToken });
-  } catch (error) {
-    logger.error('Refresh token error:', error);
-    res.status(401).json({ error: 'Invalid refresh token' });
-  }
-});
-
-// -----------------------------
-// Payment Endpoints (Using Paystack)
-// -----------------------------
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const baseURL = process.env.PAYSTACK_BASE_URL || 'https://api.paystack.co';
-
-async function verifyTransaction(reference) {
-  try {
-    const response = await axios.get(
-      `${baseURL}/transaction/verify/${encodeURIComponent(reference)}`,
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
-    );
-    logger.info({ action: 'VerificationResponse', reference, status: response.status, data: response.data });
-    return response.data;
-  } catch (error) {
-    logger.error({ action: 'VerificationError', reference, error: error.response ? error.response.data : error.message });
-    throw error;
-  }
+  return collection;
 }
 
-app.post('/initiate-payment', async (req, res) => {
+// Health-check endpoint.
+app.get('/api/health', (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// Search endpoint: search by productTitle and category.
+app.get('/api/search', async (req, res) => {
+  const query = req.query.q;
+  if (!query) {
+    return res.status(400).json({ error: "Missing query parameter 'q'" });
+  }
+  
+  // Limit parameter to control number of returned products (default 20)
+  const limit = parseInt(req.query.limit, 10) || 20;
+  
   try {
-    await dbConnect();
-    const { amount, email, phone } = req.body;
-    logger.info({ action: 'PaymentInitiated', amount, email, phone });
-    const response = await axios.post(
-      `${baseURL}/charge`,
-      { amount: amount * 100, email, mobile_money: { phone, provider: 'mpesa' } },
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
-    );
-    logger.info({ action: 'PaystackAPIResponse', status: response.status, data: response.data });
-    const verification = await verifyTransaction(response.data.data.reference);
-    res.json({ success: true, paymentInitiated: response.data, verificationResult: verification });
-  } catch (error) {
-    logger.error({ action: 'PaymentError', error: error.response ? error.response.data : error.message, stack: error.stack });
-    const statusCode = error.response ? error.response.status : 500;
-    res.status(statusCode).json({ success: false, error: error.response ? error.response.data : error.message });
+    const collection = await getProductsCollection();
+    // Use MongoDB's $text operator for full-text search.
+    // Also sort by _id in ascending order.
+    const results = await collection.find({ $text: { $search: query } })
+      .sort({ _id: 1 })
+      .limit(limit)
+      .toArray();
+    res.json(results);
+  } catch (err) {
+    console.error("Error during search:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.get('/verify-payment/:reference', async (req, res) => {
+// Alternative search endpoint sorting in descending order.
+app.get('/api/search1', async (req, res) => {
+  const query = req.query.q;
+  if (!query) {
+    return res.status(400).json({ error: "Missing query parameter 'q'" });
+  }
+  
+  // Limit parameter to control number of returned products (default 20)
+  const limit = parseInt(req.query.limit, 10) || 20;
+  
   try {
-    await dbConnect();
-    const { reference } = req.params;
-    logger.info({ action: 'ManualVerificationAttempt', reference });
-    const result = await verifyTransaction(reference);
-    if (result.data.status === 'success') {
-      const amount = result.data.amount / 100;
-      const user = await User.findOne({ email: result.data.customer.email });
-      if (user) {
-        user.investmentBalance += amount;
-        user.totalInvested += amount;
-        user.mines = Math.floor(user.investmentBalance / 500);
-        await user.save();
-      }
-    }
-    res.json({ success: true, verifiedData: result.data });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.response ? error.response.data : error.message });
+    const collection = await getProductsCollection();
+    // Use MongoDB's $text operator for full-text search.
+    // Also sort by _id in descending order.
+    const results = await collection.find({ $text: { $search: query } })
+      .sort({ _id: -1 })
+      .limit(limit)
+      .toArray();
+    res.json(results);
+  } catch (err) {
+    console.error("Error during search:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.post('/paystack-webhook', (req, res) => {
-  const signature = req.headers['x-paystack-signature'];
-  const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY)
-                     .update(JSON.stringify(req.body))
-                     .digest('hex');
-  if (hash !== signature) {
-    logger.error({ action: 'WebhookSecurityFail', receivedSignature: signature, computedHash: hash });
-    return res.status(401).send('Unauthorized');
-  }
-  const event = req.body;
-  logger.info({ action: 'WebhookReceived', event });
-  switch (event.event) {
-    case 'charge.success':
-      logger.info({ action: 'PaymentSuccess', data: event.data });
-      User.findOne({ email: event.data.customer.email }).then(user => {
-        if (user) {
-          user.investmentBalance += event.data.amount / 100;
-          user.totalInvested += event.data.amount / 100;
-          user.mines = Math.floor(user.investmentBalance / 500);
-          user.save();
-        }
-      });
-      break;
-    case 'charge.failed':
-      logger.error({ action: 'PaymentFailed', data: event.data });
-      break;
-    case 'transfer.success':
-      logger.info({ action: 'TransferSuccess', data: event.data });
-      break;
-    default:
-      logger.info({ action: 'UnhandledEvent', data: event });
-  }
-  res.sendStatus(200);
-});
-
-// -----------------------------
-// Start Server / Export for Serverless Deployment
-// -----------------------------
-if (process.env.NODE_ENV !== 'serverless') {
+// Local development: listen on a port if not in production.
+if (process.env.NODE_ENV !== 'production' || require.main === module) {
+  const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
-    logger.info(`Server running on port ${PORT}`);
+    console.log(`Server running locally on port ${PORT}`);
   });
 }
 
-module.exports = serverless(app);
+// Export for serverless deployment.
+// Wrap the handler so that context.callbackWaitsForEmptyEventLoop is set to false.
+const handler = serverless(app);
+module.exports.handler = (event, context, callback) => {
+  context.callbackWaitsForEmptyEventLoop = false;
+  return handler(event, context, callback);
+};
