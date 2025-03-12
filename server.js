@@ -59,18 +59,43 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors({
-  origin: 'https://crypto-lovat-kappa.vercel.app',
+  origin: 'https://crypto-lovat-kappa.vercel.app', // Change this to your production frontend's URL when needed.
   credentials: true,
 }));
-app.options('*', cors());
+
+// Catch-all OPTIONS route to handle preflight requests
+app.options('*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://crypto-lovat-kappa.vercel.app'); // Update for production.
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  return res.status(200).end();
+});
+
+// Global middleware to set CORS headers on every response
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://crypto-lovat-kappa.vercel.app'); // Update as needed.
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
+// Logging HTTP requests with Morgan
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
+
+// Rate limiter with fallback key generator for IP
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100,
-  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown',
+  keyGenerator: (req, res) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use(limiter);
+
 
 // -----------------------------
 // User Schema & Model
