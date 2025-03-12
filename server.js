@@ -20,9 +20,10 @@ async function getMongoClient() {
     useNewUrlParser: true,
     useUnifiedTopology: true,
     tls: true,
-    tlsAllowInvalidCertificates: true, // For testing – remove in production
-    connectTimeoutMS: 30000,
-    socketTimeoutMS: 30000,
+    // Allow invalid certs in non-production environments only
+    tlsAllowInvalidCertificates: process.env.NODE_ENV !== 'production',
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 5000,
     retryWrites: false
   });
   await client.connect();
@@ -33,35 +34,34 @@ async function getMongoClient() {
 async function getProductsCollection() {
   const client = await getMongoClient();
   const db = client.db(DB_NAME);
-  const collection = db.collection("products");
+  return db.collection("products");
+}
+
+// Create the text index once on cold start
+(async () => {
   try {
-    // Ensure a text index on productTitle and category
+    const client = await getMongoClient();
+    const db = client.db(DB_NAME);
+    const collection = db.collection("products");
     await collection.createIndex({ productTitle: "text", category: "text" });
+    console.log("Index created successfully");
   } catch (err) {
     console.error("Error creating index:", err);
   }
-  return collection;
-}
+})();
 
 // Health-check endpoint.
 app.get('/api/health', (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Search endpoint: search by productTitle and category.
+// Search endpoint: sort by _id in ascending order.
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
-  if (!query) {
-    return res.status(400).json({ error: "Missing query parameter 'q'" });
-  }
-  
-  // Limit parameter to control number of returned products (default 20)
+  if (!query) return res.status(400).json({ error: "Missing query parameter 'q'" });
   const limit = parseInt(req.query.limit, 10) || 20;
-  
   try {
     const collection = await getProductsCollection();
-    // Use MongoDB's $text operator for full-text search.
-    // Also sort by _id in ascending order.
     const results = await collection.find({ $text: { $search: query } })
       .sort({ _id: 1 })
       .limit(limit)
@@ -73,20 +73,13 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Alternative search endpoint: sort by _id descending.
+// Alternative search endpoint: sort by _id in descending order.
 app.get('/api/search1', async (req, res) => {
   const query = req.query.q;
-  if (!query) {
-    return res.status(400).json({ error: "Missing query parameter 'q'" });
-  }
-  
-  // Limit parameter to control number of returned products (default 20)
+  if (!query) return res.status(400).json({ error: "Missing query parameter 'q'" });
   const limit = parseInt(req.query.limit, 10) || 20;
-  
   try {
     const collection = await getProductsCollection();
-    // Use MongoDB's $text operator for full-text search.
-    // Also sort by _id in descending order.
     const results = await collection.find({ $text: { $search: query } })
       .sort({ _id: -1 })
       .limit(limit)
@@ -98,7 +91,7 @@ app.get('/api/search1', async (req, res) => {
   }
 });
 
-// Local development: listen on a port if not in production.
+// For local development: listen on a port if not in production.
 if (process.env.NODE_ENV !== 'production' || require.main === module) {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
@@ -106,7 +99,8 @@ if (process.env.NODE_ENV !== 'production' || require.main === module) {
   });
 }
 
-// Wrap the serverless handler to set callbackWaitsForEmptyEventLoop to false.
+// Export default handler for serverless deployment.
+// We set callbackWaitsForEmptyEventLoop to false so that open connections don't delay the response.
 const handler = serverless(app);
 module.exports = (event, context, callback) => {
   context.callbackWaitsForEmptyEventLoop = false;
