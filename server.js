@@ -80,15 +80,35 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // -----------------------------
-// MongoDB Connection
+// MongoDB Connection and Initialization
 // -----------------------------
 const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
   logger.error('MONGODB_URI is not defined in .env');
   process.exit(1);
 }
-mongoose.connect(MONGODB_URI)
-.then(() => logger.info('MongoDB connected'))
+
+mongoose.connect(MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+.then(() => {
+  logger.info('MongoDB connected');
+  // Check if any collections exist. If not, create a default collection to initialize the database.
+  mongoose.connection.db.listCollections().toArray((err, collections) => {
+      if (err) {
+          logger.error('Error listing collections:', err);
+      } else {
+          if (collections.length === 0) {
+              // No collections found—create a default 'users' collection.
+              mongoose.connection.db.createCollection('users')
+              .then(() => {
+                  logger.info('Default "users" collection created to initialize the database.');
+              })
+              .catch(err => logger.error('Error creating default "users" collection:', err));
+          } else {
+              logger.info('Database already initialized with collections.');
+          }
+      }
+  });
+})
 .catch(err => logger.error('MongoDB connection error:', err));
 
 // -----------------------------
