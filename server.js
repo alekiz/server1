@@ -16,52 +16,29 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// --- Global Cached Mongoose Connection ---
-// This caches the connection across invocations.
+// --- Global DB Connection (cached) ---
 if (!global.__MONGO_CONN__) {
-  global.__MONGO_CONN__ = null;
-}
-
-async function dbConnect() {
-  if (global.__MONGO_CONN__) {
-    return global.__MONGO_CONN__;
-  }
-  if (!process.env.MONGODB_URI) {
-    throw new Error("MONGODB_URI is not defined in .env");
-  }
-  // Connect with options tailored for serverless environments.
-  global.__MONGO_CONN__ = mongoose
-    .connect(process.env.MONGODB_URI, {
-      connectTimeoutMS: 30000,
-      socketTimeoutMS: 30000,
-      tls: true,
-      tlsAllowInvalidCertificates: process.env.NODE_ENV !== 'production',
-      retryWrites: false
-    })
-    .then(conn => {
-      console.log("MongoDB connected (cached)");
+  global.__MONGO_CONN__ = mongoose.connect(process.env.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+  })
+    .then((conn) => {
+      console.log('MongoDB connected (cached)');
       return conn;
     })
-    .catch(err => {
-      console.error("MongoDB connection error:", err);
-      // Instead of process.exit(1), we throw the error.
-      throw err;
+    .catch((err) => {
+      console.error('MongoDB connection error:', err);
     });
-  return global.__MONGO_CONN__;
 }
 
-// Initiate the connection on cold start.
-dbConnect().catch(err => {
-  // Log error on cold start; the function will error out when invoked.
-  console.error("Initial MongoDB connection failed:", err);
-});
+const dbConnect = () => global.__MONGO_CONN__;
 
-// -----------------------------
-// Express Middleware & Configuration
-// -----------------------------
+// Trust the first proxy (for rate limiting behind proxies/Vercel)
 app.set('trust proxy', 1);
 
-// Logger configuration with Winston.
+// Logger configuration
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -71,32 +48,32 @@ const logger = winston.createLogger({
   transports: [
       new winston.transports.Console(),
       new winston.transports.File({ filename: 'error.log', level: 'error' }),
-      new winston.transports.File({ filename: 'combined.log' })
+      new winston.transports.File({ filename: 'combined.log' }),
   ],
 });
 
-// Simplified CORS configuration.
-app.use(cors({
-  origin: 'https://crypto1-ten.vercel.app', // Update this URL as needed.
-  credentials: true,
-}));
-app.options('*', cors());
-
+// -----------------------------
+// Middlewares
+// -----------------------------
 app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
+app.use(cors({
+  origin: 'https://crypto1-ten.vercel.app',
+  credentials: true,
+}));
+app.options('*', cors());
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
-
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
-  keyGenerator: (req, res) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown',
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use(limiter);
 
 // -----------------------------
-// Mongoose User Schema & Model
+// User Schema & Model
 // -----------------------------
 const userSchema = new mongoose.Schema({
   username:    { type: String, required: true },
@@ -108,12 +85,13 @@ const userSchema = new mongoose.Schema({
   totalInvested: { type: Number, default: 0 },
   mines: { type: Number, default: 0 },
   role: { type: String, default: "user" },
-  refreshToken: { type: String }
+  refreshToken: { type: String },
 }, { timestamps: true });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 // -----------------------------
-// Utility Functions for JWT Tokens
+// JWT Utility Functions
 // -----------------------------
 const generateAccessToken = (user) => jwt.sign(
   { id: user._id, email: user.email, role: user.role },
@@ -128,7 +106,7 @@ const generateRefreshToken = (user) => jwt.sign(
 );
 
 // -----------------------------
-// Middleware: Protect Routes
+// Middleware: Protect Route
 // -----------------------------
 const protect = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -161,22 +139,15 @@ app.post('/api/auth/signup', async (req, res) => {
     }
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const user = await User.create({
-      username,
-      email,
-      password: hashedPassword,
-      country,
-      phoneNumber,
-      role: "user"
-    });
+    const user = await User.create({ username, email, password: hashedPassword, country, phoneNumber, role: "user" });
     const accessToken = generateAccessToken(user);
     const refreshToken = generateRefreshToken(user);
     user.refreshToken = refreshToken;
     await user.save();
     res.cookie('refreshToken', refreshToken, { 
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "Strict",
+      httpOnly: true, 
+      secure: process.env.NODE_ENV === "production", 
+      sameSite: "Strict", 
       maxAge: 7 * 24 * 60 * 60 * 1000 
     });
     res.status(201).json({ message: 'Sign up successful. Please sign in.', accessToken });
@@ -190,9 +161,7 @@ app.post('/api/auth/signin', async (req, res) => {
   try {
     await dbConnect();
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Please provide email and password' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Please provide email and password' });
     const user = await User.findOne({ email });
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -202,9 +171,9 @@ app.post('/api/auth/signin', async (req, res) => {
     user.refreshToken = refreshToken;
     await user.save();
     res.cookie('refreshToken', refreshToken, { 
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "Strict",
+      httpOnly: true, 
+      secure: process.env.NODE_ENV === "production", 
+      sameSite: "Strict", 
       maxAge: 7 * 24 * 60 * 60 * 1000 
     });
     res.status(200).json({ message: 'Sign in successful', accessToken, roles: [user.role] });
@@ -230,9 +199,7 @@ app.post('/api/auth/refresh', async (req, res) => {
   try {
     await dbConnect();
     const { refreshToken } = req.cookies;
-    if (!refreshToken) {
-      return res.status(401).json({ error: 'No refresh token provided' });
-    }
+    if (!refreshToken) return res.status(401).json({ error: 'No refresh token provided' });
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
     const user = await User.findById(decoded.id);
     if (!user || user.refreshToken !== refreshToken) {
@@ -243,9 +210,9 @@ app.post('/api/auth/refresh', async (req, res) => {
     user.refreshToken = newRefreshToken;
     await user.save();
     res.cookie('refreshToken', newRefreshToken, { 
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "Strict",
+      httpOnly: true, 
+      secure: process.env.NODE_ENV === "production", 
+      sameSite: "Strict", 
       maxAge: 7 * 24 * 60 * 60 * 1000 
     });
     res.status(200).json({ accessToken: newAccessToken });
@@ -353,15 +320,7 @@ app.post('/paystack-webhook', (req, res) => {
 });
 
 // -----------------------------
-// Start Server / Export for Serverless Deployment
+// Export for Serverless
 // -----------------------------
-if (process.env.NODE_ENV !== 'serverless') {
-  app.listen(PORT, () => {
-    logger.info(`Server running on port ${PORT}`);
-  });
-}
-
-// Export both the Express app and the serverless handler.
-const handler = serverless(app);
-module.exports = handler;
-module.exports.app = app;
+module.exports = app;
+module.exports.handler = serverless(app);
