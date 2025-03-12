@@ -16,41 +16,25 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-/* 
-  --- MongoDB Connection Caching using globalThis ---
-  This pattern caches the connection across function invocations in serverless environments.
-*/
-let cached = globalThis.__MONGO_CONN__ || { conn: null, promise: null };
-globalThis.__MONGO_CONN__ = cached;
-
-async function dbConnect() {
-  if (cached.conn) {
-    return cached.conn;
-  }
-  if (!process.env.MONGODB_URI) {
-    throw new Error('MONGODB_URI is not defined in .env');
-  }
-  if (!cached.promise) {
-    cached.promise = mongoose.connect(process.env.MONGODB_URI);
-  }
-  cached.conn = await cached.promise;
-  return cached.conn;
+// --- Global DB Connection (cached) ---
+if (!global.__MONGO_CONN__) {
+  global.__MONGO_CONN__ = mongoose.connect(process.env.MONGODB_URI)
+    .then((conn) => {
+      console.log('MongoDB connected (cached)');
+      return conn;
+    })
+    .catch((err) => {
+      console.error('MongoDB connection error:', err);
+      process.exit(1);
+    });
 }
 
-// Initiate the database connection on cold start.
-dbConnect()
-  .then(() => {
-    console.log('MongoDB connected (cached)');
-  })
-  .catch(err => {
-    console.error('MongoDB connection error:', err);
-    process.exit(1);
-  });
+const dbConnect = () => global.__MONGO_CONN__;
 
-// Trust the first proxy (useful behind proxies/Vercel)
+// Trust the first proxy (for rate limiting behind proxies/Vercel)
 app.set('trust proxy', 1);
 
-// Logger configuration with Winston
+// Logger configuration
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -71,7 +55,7 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors({
-  origin: 'https://crypto1-ten.vercel.app', // Update as needed.
+  origin: 'https://crypto1-ten.vercel.app',
   credentials: true,
 }));
 app.options('*', (req, res) => {
@@ -86,9 +70,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
   next();
 });
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
@@ -119,23 +101,19 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 // -----------------------------
-// Utility Functions for JWT
+// JWT Utility Functions
 // -----------------------------
-const generateAccessToken = (user) => {
-  return jwt.sign(
-    { id: user._id, email: user.email, role: user.role },
-    process.env.JWT_SECRET,
-    { expiresIn: '15m' }
-  );
-};
+const generateAccessToken = (user) => jwt.sign(
+  { id: user._id, email: user.email, role: user.role },
+  process.env.JWT_SECRET,
+  { expiresIn: '15m' }
+);
 
-const generateRefreshToken = (user) => {
-  return jwt.sign(
-    { id: user._id, email: user.email, role: user.role },
-    process.env.JWT_REFRESH_SECRET,
-    { expiresIn: '7d' }
-  );
-};
+const generateRefreshToken = (user) => jwt.sign(
+  { id: user._id, email: user.email, role: user.role },
+  process.env.JWT_REFRESH_SECRET,
+  { expiresIn: '7d' }
+);
 
 // -----------------------------
 // Middleware: Protect Route
@@ -171,14 +149,7 @@ app.post('/api/auth/signup', async (req, res) => {
     }
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const user = await User.create({
-      username,
-      email,
-      password: hashedPassword,
-      country,
-      phoneNumber,
-      role: "user"
-    });
+    const user = await User.create({ username, email, password: hashedPassword, country, phoneNumber, role: "user" });
     const accessToken = generateAccessToken(user);
     const refreshToken = generateRefreshToken(user);
     user.refreshToken = refreshToken;
@@ -200,15 +171,9 @@ app.post('/api/auth/signin', async (req, res) => {
   try {
     await dbConnect();
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Please provide email and password' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Please provide email and password' });
     const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
+    if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     const accessToken = generateAccessToken(user);
@@ -232,9 +197,7 @@ app.get('/api/auth/protected', protect, async (req, res) => {
   try {
     await dbConnect();
     const user = await User.findById(req.user.id).select('-password -__v -refreshToken');
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
     res.status(200).json({ user });
   } catch (error) {
     logger.error('Protected route error:', error);
@@ -246,9 +209,7 @@ app.post('/api/auth/refresh', async (req, res) => {
   try {
     await dbConnect();
     const { refreshToken } = req.cookies;
-    if (!refreshToken) {
-      return res.status(401).json({ error: 'No refresh token provided' });
-    }
+    if (!refreshToken) return res.status(401).json({ error: 'No refresh token provided' });
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
     const user = await User.findById(decoded.id);
     if (!user || user.refreshToken !== refreshToken) {
@@ -281,25 +242,12 @@ async function verifyTransaction(reference) {
   try {
     const response = await axios.get(
       `${baseURL}/transaction/verify/${encodeURIComponent(reference)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`
-        }
-      }
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
     );
-    logger.info({
-      action: 'VerificationResponse',
-      reference,
-      status: response.status,
-      data: response.data
-    });
+    logger.info({ action: 'VerificationResponse', reference, status: response.status, data: response.data });
     return response.data;
   } catch (error) {
-    logger.error({
-      action: 'VerificationError',
-      reference,
-      error: error.response ? error.response.data : error.message
-    });
+    logger.error({ action: 'VerificationError', reference, error: error.response ? error.response.data : error.message });
     throw error;
   }
 }
@@ -311,27 +259,14 @@ app.post('/initiate-payment', async (req, res) => {
     logger.info({ action: 'PaymentInitiated', amount, email, phone });
     const response = await axios.post(
       `${baseURL}/charge`,
-      {
-        amount: amount * 100, // Convert to smallest currency unit.
-        email,
-        mobile_money: { phone, provider: 'mpesa' }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { amount: amount * 100, email, mobile_money: { phone, provider: 'mpesa' } },
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
     );
     logger.info({ action: 'PaystackAPIResponse', status: response.status, data: response.data });
     const verification = await verifyTransaction(response.data.data.reference);
     res.json({ success: true, paymentInitiated: response.data, verificationResult: verification });
   } catch (error) {
-    logger.error({
-      action: 'PaymentError',
-      error: error.response ? error.response.data : error.message,
-      stack: error.stack
-    });
+    logger.error({ action: 'PaymentError', error: error.response ? error.response.data : error.message, stack: error.stack });
     const statusCode = error.response ? error.response.status : 500;
     res.status(statusCode).json({ success: false, error: error.response ? error.response.data : error.message });
   }
