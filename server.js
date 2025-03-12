@@ -1,116 +1,166 @@
-const express = require('express');
-const { MongoClient } = require('mongodb');
-const serverless = require('serverless-http');
 require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
+const serverless = require('serverless-http');
+const morgan = require('morgan');
+const winston = require('winston');
+const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 4000;
 
-// Use the environment variable if set; otherwise, use the provided connection string.
-const MONGODB_URL =
-  process.env.MONGODB_URL ||
-  'mongodb+srv://alexmutugi257:Ajib2536@cluster0.d0acd.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
-const DB_NAME = process.env.DB_NAME || 'naivasProducts';
-
-// Global cache for the MongoDB client.
-let cachedClient = null;
-
-async function getMongoClient() {
-  if (cachedClient) return cachedClient;
-  const client = new MongoClient(MONGODB_URL, {
-    // These options help the connection fail fast if needed.
+// --- Global DB Connection (cached) ---
+if (!global.__MONGO_CONN__) {
+  global.__MONGO_CONN__ = mongoose.connect(process.env.MONGODB_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
-    tls: true,
-    // Allow invalid certificates in non-production only.
-    tlsAllowInvalidCertificates: process.env.NODE_ENV !== 'production',
-    connectTimeoutMS: 5000,
-    socketTimeoutMS: 5000,
-    retryWrites: false
-  });
-  await client.connect();
-  cachedClient = client;
-  return client;
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+  })
+    .then((conn) => {
+      console.log('MongoDB connected (cached)');
+      return conn;
+    })
+    .catch((err) => {
+      console.error('MongoDB connection error:', err);
+    }); // Removed process.exit(1)
 }
 
-async function getProductsCollection() {
-  const client = await getMongoClient();
-  const db = client.db(DB_NAME);
-  const collection = db.collection('products');
-  try {
-    // Create a text index on productTitle and category on cold start.
-    await collection.createIndex({ productTitle: 'text', category: 'text' });
-    console.log('Index created successfully.');
-  } catch (err) {
-    console.error('Error creating index:', err);
-  }
-  return collection;
-}
+const dbConnect = () => global.__MONGO_CONN__;
 
-// Health-check endpoint.
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+// Trust the first proxy (for rate limiting behind proxies/Vercel)
+app.set('trust proxy', 1);
+
+// Logger configuration
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+      winston.format.timestamp(),
+      winston.format.json()
+  ),
+  transports: [
+      new winston.transports.Console(),
+      new winston.transports.File({ filename: 'error.log', level: 'error' }),
+      new winston.transports.File({ filename: 'combined.log' }),
+  ],
 });
 
-// Search endpoint: sorts by _id ascending.
-app.get('/api/search', async (req, res) => {
-  const query = req.query.q;
-  if (!query) {
-    return res.status(400).json({ error: "Missing query parameter 'q'" });
-  }
-  
-  // Limit parameter to control number of returned products (default 20).
-  const limit = parseInt(req.query.limit, 10) || 20;
-  
-  try {
-    const collection = await getProductsCollection();
-    const results = await collection.find({ $text: { $search: query } })
-      .sort({ _id: 1 })
-      .limit(limit)
-      .toArray();
-    res.json(results);
-  } catch (err) {
-    console.error('Error during search:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+// -----------------------------
+// Middlewares
+// -----------------------------
+app.use(express.json());
+app.use(cookieParser());
+app.use(helmet());
+app.use(cors({
+  origin: 'https://crypto1-ten.vercel.app',
+  credentials: true,
+}));
+app.options('*', cors());
+app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown',
+  message: 'Too many requests from this IP, please try again later.'
 });
+app.use(limiter);
 
-// Alternative search endpoint: sorts by _id descending.
-app.get('/api/search1', async (req, res) => {
-  const query = req.query.q;
-  if (!query) {
-    return res.status(400).json({ error: "Missing query parameter 'q'" });
+// -----------------------------
+// User Schema & Model
+// -----------------------------
+const userSchema = new mongoose.Schema({
+  username:    { type: String, required: true },
+  email:       { type: String, required: true, unique: true },
+  password:    { type: String, required: true },
+  country:     { type: String, required: true },
+  phoneNumber: { type: String, required: true },
+  investmentBalance: { type: Number, default: 0 },
+  totalInvested: { type: Number, default: 0 },
+  mines: { type: Number, default: 0 },
+  role: { type: String, default: "user" },
+  refreshToken: { type: String },
+}, { timestamps: true });
+
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+
+// -----------------------------
+// JWT Utility Functions
+// -----------------------------
+const generateAccessToken = (user) => jwt.sign(
+  { id: user._id, email: user.email, role: user.role },
+  process.env.JWT_SECRET,
+  { expiresIn: '15m' }
+);
+
+const generateRefreshToken = (user) => jwt.sign(
+  { id: user._id, email: user.email, role: user.role },
+  process.env.JWT_REFRESH_SECRET,
+  { expiresIn: '7d' }
+);
+
+// -----------------------------
+// Middleware: Protect Route
+// -----------------------------
+const protect = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Not authorized, no token provided' });
   }
-  
-  const limit = parseInt(req.query.limit, 10) || 20;
-  
+  const token = authHeader.split(' ')[1];
   try {
-    const collection = await getProductsCollection();
-    const results = await collection.find({ $text: { $search: query } })
-      .sort({ _id: -1 })
-      .limit(limit)
-      .toArray();
-    res.json(results);
-  } catch (err) {
-    console.error('Error during search:', err);
-    res.status(500).json({ error: 'Internal server error' });
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = decoded;
+      next();
+  } catch (error) {
+      return res.status(401).json({ error: 'Not authorized, token failed' });
   }
-});
-
-// For local development: listen on a port if not in production.
-if (process.env.NODE_ENV !== 'production' || require.main === module) {
-  const PORT = process.env.PORT || 3001;
-  app.listen(PORT, () => {
-    console.log(`Server running locally on port ${PORT}`);
-  });
-}
-
-// Export a default handler for serverless deployment.
-// Set callbackWaitsForEmptyEventLoop to false to prevent timeouts.
-const handler = serverless(app);
-module.exports = (event, context, callback) => {
-  context.callbackWaitsForEmptyEventLoop = false;
-  return handler(event, context, callback);
 };
+
+// -----------------------------
+// Authentication Endpoints
+// -----------------------------
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    await dbConnect();
+    const { username, email, password, country, phoneNumber } = req.body;
+    if (!username || !email || !password || !country || !phoneNumber) {
+      return res.status(400).json({ error: 'Please provide all required fields' });
+    }
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(409).json({ error: 'Username or Email already exists' });
+    }
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+    const user = await User.create({ username, email, password: hashedPassword, country, phoneNumber, role: "user" });
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+    user.refreshToken = refreshToken;
+    await user.save();
+    res.cookie('refreshToken', refreshToken, { 
+      httpOnly: true, 
+      secure: process.env.NODE_ENV === "production", 
+      sameSite: "Strict", 
+      maxAge: 7 * 24 * 60 * 60 * 1000 
+    });
+    res.status(201).json({ message: 'Sign up successful. Please sign in.', accessToken });
+  } catch (error) {
+    logger.error('Sign up error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ... [Keep other endpoints the same as in the original code] ...
+
+// -----------------------------
+// Start Server / Export for Serverless
+// -----------------------------
+module.exports = app;
+module.exports.handler = serverless(app);
