@@ -16,25 +16,45 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// --- Global DB Connection (cached) ---
+// --- Global Cached Mongoose Connection ---
+// This caching pattern reuses the connection across invocations.
+// It is similar to your MongoClient caching where we use a global variable.
 if (!global.__MONGO_CONN__) {
-  global.__MONGO_CONN__ = mongoose.connect(process.env.MONGODB_URI)
-    .then((conn) => {
-      console.log('MongoDB connected (cached)');
-      return conn;
-    })
-    .catch((err) => {
-      console.error('MongoDB connection error:', err);
-      process.exit(1);
-    });
+  global.__MONGO_CONN__ = null;
 }
 
-const dbConnect = () => global.__MONGO_CONN__;
+async function dbConnect() {
+  if (global.__MONGO_CONN__) {
+    return global.__MONGO_CONN__;
+  }
+  if (!process.env.MONGODB_URI) {
+    throw new Error("MONGODB_URI is not defined in .env");
+  }
+  // Connect with options similar to your MongoClient snippet.
+  // Note: In Mongoose 6+ some options like useNewUrlParser and useUnifiedTopology are no longer required.
+  global.__MONGO_CONN__ = mongoose.connect(process.env.MONGODB_URI, {
+    connectTimeoutMS: 30000,
+    socketTimeoutMS: 30000,
+    tls: true,
+    tlsAllowInvalidCertificates: process.env.NODE_ENV !== 'production',
+    retryWrites: false
+  });
+  return global.__MONGO_CONN__;
+}
 
-// Trust the first proxy (for rate limiting behind proxies/Vercel)
+// Initiate the connection on cold start.
+dbConnect()
+  .then(() => console.log("MongoDB connected (cached)"))
+  .catch(err => {
+    console.error("MongoDB connection error:", err);
+    process.exit(1);
+  });
+
+// -----------------------------
+// Express Middleware & Configuration
+// -----------------------------
 app.set('trust proxy', 1);
 
-// Logger configuration
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -48,14 +68,11 @@ const logger = winston.createLogger({
   ],
 });
 
-// -----------------------------
-// Middlewares
-// -----------------------------
 app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors({
-  origin: 'https://crypto1-ten.vercel.app',
+  origin: 'https://crypto1-ten.vercel.app', // Update this URL as needed.
   credentials: true,
 }));
 app.options('*', (req, res) => {
@@ -83,7 +100,7 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // -----------------------------
-// User Schema & Model
+// Mongoose User Schema & Model
 // -----------------------------
 const userSchema = new mongoose.Schema({
   username:    { type: String, required: true },
@@ -97,11 +114,10 @@ const userSchema = new mongoose.Schema({
   role: { type: String, default: "user" },
   refreshToken: { type: String },
 }, { timestamps: true });
-
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 // -----------------------------
-// JWT Utility Functions
+// Utility Functions for JWT Tokens
 // -----------------------------
 const generateAccessToken = (user) => jwt.sign(
   { id: user._id, email: user.email, role: user.role },
@@ -116,7 +132,7 @@ const generateRefreshToken = (user) => jwt.sign(
 );
 
 // -----------------------------
-// Middleware: Protect Route
+// Middleware: Protect Routes
 // -----------------------------
 const protect = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -149,14 +165,21 @@ app.post('/api/auth/signup', async (req, res) => {
     }
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const user = await User.create({ username, email, password: hashedPassword, country, phoneNumber, role: "user" });
+    const user = await User.create({
+      username,
+      email,
+      password: hashedPassword,
+      country,
+      phoneNumber,
+      role: "user"
+    });
     const accessToken = generateAccessToken(user);
     const refreshToken = generateRefreshToken(user);
     user.refreshToken = refreshToken;
     await user.save();
     res.cookie('refreshToken', refreshToken, { 
       httpOnly: true, 
-      secure: process.env.NODE_ENV === "production", 
+      secure: process.env.NODE_ENV === "production",
       sameSite: "Strict", 
       maxAge: 7 * 24 * 60 * 60 * 1000 
     });
@@ -171,7 +194,9 @@ app.post('/api/auth/signin', async (req, res) => {
   try {
     await dbConnect();
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Please provide email and password' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Please provide email and password' });
+    }
     const user = await User.findOne({ email });
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -181,7 +206,7 @@ app.post('/api/auth/signin', async (req, res) => {
     user.refreshToken = refreshToken;
     await user.save();
     res.cookie('refreshToken', refreshToken, { 
-      httpOnly: true, 
+      httpOnly: true,
       secure: process.env.NODE_ENV === "production", 
       sameSite: "Strict", 
       maxAge: 7 * 24 * 60 * 60 * 1000 
@@ -209,7 +234,9 @@ app.post('/api/auth/refresh', async (req, res) => {
   try {
     await dbConnect();
     const { refreshToken } = req.cookies;
-    if (!refreshToken) return res.status(401).json({ error: 'No refresh token provided' });
+    if (!refreshToken) {
+      return res.status(401).json({ error: 'No refresh token provided' });
+    }
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
     const user = await User.findById(decoded.id);
     if (!user || user.refreshToken !== refreshToken) {
@@ -220,8 +247,8 @@ app.post('/api/auth/refresh', async (req, res) => {
     user.refreshToken = newRefreshToken;
     await user.save();
     res.cookie('refreshToken', newRefreshToken, { 
-      httpOnly: true, 
-      secure: process.env.NODE_ENV === "production", 
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
       sameSite: "Strict", 
       maxAge: 7 * 24 * 60 * 60 * 1000 
     });
@@ -330,7 +357,7 @@ app.post('/paystack-webhook', (req, res) => {
 });
 
 // -----------------------------
-// Start Server / Export for Serverless
+// Start Server / Export for Serverless Deployment
 // -----------------------------
 if (process.env.NODE_ENV !== 'serverless') {
   app.listen(PORT, () => {
