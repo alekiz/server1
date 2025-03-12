@@ -17,32 +17,27 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 /* 
-  --- MongoDB Connection Caching ---
-  In serverless environments, we cache the connection to avoid creating a new one 
-  on every function invocation. This pattern helps reduce cold-start delays.
+  --- MongoDB Connection Caching using globalThis ---
+  This pattern caches the connection across function invocations in serverless environments.
 */
-let cached = global.mongoose;
-if (!cached) {
-  cached = global.mongoose = { conn: null, promise: null };
-}
+let cached = globalThis.__MONGO_CONN__ || { conn: null, promise: null };
+globalThis.__MONGO_CONN__ = cached;
 
 async function dbConnect() {
   if (cached.conn) {
     return cached.conn;
   }
+  if (!process.env.MONGODB_URI) {
+    throw new Error('MONGODB_URI is not defined in .env');
+  }
   if (!cached.promise) {
-    if (!process.env.MONGODB_URI) {
-      throw new Error('MONGODB_URI is not defined in .env');
-    }
-    // Notice that we call mongoose.connect without deprecated options.
-    cached.promise = mongoose.connect(process.env.MONGODB_URI)
-      .then(m => m);
+    cached.promise = mongoose.connect(process.env.MONGODB_URI);
   }
   cached.conn = await cached.promise;
   return cached.conn;
 }
 
-// Connect to MongoDB during cold start.
+// Initiate the database connection on cold start.
 dbConnect()
   .then(() => {
     console.log('MongoDB connected (cached)');
@@ -76,7 +71,7 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors({
-  origin: 'https://crypto1-ten.vercel.app', // Update this URL as needed.
+  origin: 'https://crypto1-ten.vercel.app', // Update as needed.
   credentials: true,
 }));
 app.options('*', (req, res) => {
@@ -98,7 +93,7 @@ app.use((req, res, next) => {
 });
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 100,
   keyGenerator: (req, res) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   message: 'Too many requests from this IP, please try again later.'
@@ -120,6 +115,7 @@ const userSchema = new mongoose.Schema({
   role: { type: String, default: "user" },
   refreshToken: { type: String },
 }, { timestamps: true });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 // -----------------------------
@@ -164,7 +160,7 @@ const protect = (req, res, next) => {
 // -----------------------------
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    await dbConnect(); // Ensure DB connection before proceeding.
+    await dbConnect();
     const { username, email, password, country, phoneNumber } = req.body;
     if (!username || !email || !password || !country || !phoneNumber) {
       return res.status(400).json({ error: 'Please provide all required fields' });
@@ -316,7 +312,7 @@ app.post('/initiate-payment', async (req, res) => {
     const response = await axios.post(
       `${baseURL}/charge`,
       {
-        amount: amount * 100, // Convert amount to smallest currency unit.
+        amount: amount * 100, // Convert to smallest currency unit.
         email,
         mobile_money: { phone, provider: 'mpesa' }
       },
