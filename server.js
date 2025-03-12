@@ -59,7 +59,7 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors({
-  origin: 'https://crypto1-ten.vercel.app',
+  origin: 'https://crypto-lovat-kappa.vercel.app',
   credentials: true,
 }));
 app.options('*', cors());
