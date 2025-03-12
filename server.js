@@ -272,16 +272,30 @@ app.post('/initiate-payment', async (req, res) => {
     await dbConnect();
     const { amount, email, phone } = req.body;
     logger.info({ action: 'PaymentInitiated', amount, email, phone });
+
+    // Debug: Log the Paystack secret key
+    console.log("Paystack Secret Key:", process.env.PAYSTACK_SECRET_KEY);
+
     const response = await axios.post(
       `${baseURL}/charge`,
       { amount: amount * 100, email, mobile_money: { phone, provider: 'mpesa' } },
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      }
     );
     logger.info({ action: 'PaystackAPIResponse', status: response.status, data: response.data });
+
     const verification = await verifyTransaction(response.data.data.reference);
     res.json({ success: true, paymentInitiated: response.data, verificationResult: verification });
   } catch (error) {
-    logger.error({ action: 'PaymentError', error: error.response ? error.response.data : error.message, stack: error.stack });
+    logger.error({
+      action: 'PaymentError',
+      error: error.response ? error.response.data : error.message,
+      stack: error.stack,
+    });
     const statusCode = error.response ? error.response.status : 500;
     res.status(statusCode).json({ success: false, error: error.response ? error.response.data : error.message });
   }
