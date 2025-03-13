@@ -59,13 +59,13 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors({
-  origin: 'https://crypto-lovat-kappa.vercel.app', // Change this to your production frontend's URL when needed.
+  origin: 'https://www.cryptoversemining.space', // Change this to your production frontend's URL when needed.
   credentials: true,
 }));
 
 // Catch-all OPTIONS route to handle preflight requests
 app.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://crypto-lovat-kappa.vercel.app'); // Update for production.
+  res.setHeader('Access-Control-Allow-Origin', 'https://www.cryptoversemining.space'); // Update for production.
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -74,7 +74,7 @@ app.options('*', (req, res) => {
 
 // Global middleware to set CORS headers on every response
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://crypto-lovat-kappa.vercel.app'); // Update as needed.
+  res.setHeader('Access-Control-Allow-Origin', 'https://www.cryptoversemining.space'); // Update as needed.
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
